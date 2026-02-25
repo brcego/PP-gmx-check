@@ -188,3 +188,96 @@ async function checkAccount(browser, account, config) {
     await context.close();
   }
 }
+
+// --- Main ---
+
+async function main(configPath = "config.json") {
+  // Load config
+  const configData = await fs.readFile(configPath, "utf-8");
+  const config = JSON.parse(configData);
+
+  console.log(`GMX Account Checker v2.0`);
+  console.log(`Concurrency: ${config.concurrency}`);
+  console.log(`Proxy: ${config.proxy.server || "none"}`);
+  console.log(`Headless: ${config.headless}`);
+  console.log("---");
+
+  // Read accounts
+  const accounts = await readAccounts(config.accountsFile);
+  if (accounts.length === 0) {
+    console.log("No accounts found. Exiting.");
+    return;
+  }
+
+  // Filter to accounts that need checking (resumability)
+  const toCheck = accounts.filter((a) => a.status !== "Account Active");
+  const skipped = accounts.length - toCheck.length;
+  if (skipped > 0) {
+    console.log(`Skipping ${skipped} accounts already marked as Active.`);
+  }
+  console.log(`Checking ${toCheck.length} accounts...\n`);
+
+  if (toCheck.length === 0) {
+    console.log("All accounts already active. Nothing to do.");
+    return;
+  }
+
+  // Launch browser with stealth
+  const { chromium } = await import("playwright-extra");
+  const StealthPlugin = (await import("puppeteer-extra-plugin-stealth")).default;
+  chromium.use(StealthPlugin());
+
+  const browser = await chromium.launch({
+    headless: config.headless,
+  });
+
+  try {
+    let processed = 0;
+
+    await runWithConcurrency(toCheck, config.concurrency, async (account) => {
+      await checkAccount(browser, account, config);
+      processed++;
+
+      // Write CSV after every account (for resumability)
+      await writeAccounts(config.accountsFile, accounts);
+
+      // Progress
+      console.log(`  Progress: ${processed}/${toCheck.length}\n`);
+
+      // Delay between accounts
+      if (config.timeouts.betweenAccounts > 0) {
+        await new Promise((r) => setTimeout(r, config.timeouts.betweenAccounts));
+      }
+    });
+
+    // Final summary
+    const active = accounts.filter((a) => a.status === "Account Active").length;
+    const banned = accounts.filter((a) => a.status === "Banned").length;
+    const errors = accounts.filter((a) => a.status === "Error").length;
+    const captcha = accounts.filter((a) => a.status === "CAPTCHA Blocked").length;
+    const wrongPw = accounts.filter((a) => a.status === "Wrong Password").length;
+    const irregular = accounts.filter((a) => a.status === "Irregularity").length;
+
+    console.log("\n=== DONE ===");
+    console.log(`Active: ${active}`);
+    console.log(`Banned: ${banned}`);
+    console.log(`Wrong Password: ${wrongPw}`);
+    console.log(`CAPTCHA Blocked: ${captcha}`);
+    console.log(`Irregularity: ${irregular}`);
+    console.log(`Errors: ${errors}`);
+    console.log(`Total: ${accounts.length}`);
+  } finally {
+    await browser.close();
+    console.log("Browser closed.");
+  }
+}
+
+// Only run main() when executed directly (not imported by tests)
+const isDirectRun = process.argv[1]?.endsWith("check-gmx.js");
+if (isDirectRun) {
+  const configPath = process.argv[2] || "config.json";
+  main(configPath).catch((err) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}
