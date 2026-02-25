@@ -83,112 +83,128 @@ async function attemptCheckAccount(browser, account, config) {
 
   const page = await context.newPage();
 
-  // Block images to save proxy bandwidth
-  await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico}", (route) =>
+  // Block images/fonts to save proxy bandwidth
+  await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico,woff,woff2,ttf}", (route) =>
     route.abort()
   );
 
   try {
-    // Navigate to GMX
+    // Navigate to GMX — don't wait for load, start watching for elements immediately
     console.log(`[${account.email}] Navigating to gmx.com...`);
+    page.goto("https://www.gmx.com/", { timeout: 60000 }).catch(() => {});
+
+    // Wait for login button or consent page (button may be in an iframe)
+    let found;
     try {
-      await page.goto("https://www.gmx.com/", {
-        waitUntil: "load",
-        timeout: config.timeouts.navigation,
-      });
+      found = await Promise.any([
+        page.locator("#login-button")
+          .waitFor({ state: "visible", timeout: 30000 })
+          .then(() => "login"),
+        // Poll all frames for the onetrust accept button
+        new Promise((resolve, reject) => {
+          let done = false;
+          const interval = setInterval(async () => {
+            if (done) return;
+            for (const frame of page.frames()) {
+              try {
+                const btn = frame.locator("#onetrust-accept-btn-handler");
+                if (await btn.count() > 0 && await btn.isVisible()) {
+                  done = true;
+                  clearInterval(interval);
+                  resolve("onetrust");
+                  return;
+                }
+              } catch {}
+            }
+          }, 500);
+          setTimeout(() => { clearInterval(interval); if (!done) reject(new Error("timeout")); }, 30000);
+        }),
+      ]);
     } catch {
-      await page.goto("https://www.gmx.com/", {
-        waitUntil: "domcontentloaded",
-        timeout: config.timeouts.navigation,
-      });
+      console.log(`[${account.email}] Page slow, reloading...`);
+      page.reload({ timeout: 60000 }).catch(() => {});
+      try {
+        found = await Promise.any([
+          page.locator("#login-button")
+            .waitFor({ state: "visible", timeout: 30000 })
+            .then(() => "login"),
+          new Promise((resolve, reject) => {
+            let done = false;
+            const interval = setInterval(async () => {
+              if (done) return;
+              for (const frame of page.frames()) {
+                try {
+                  const btn = frame.locator("#onetrust-accept-btn-handler");
+                  if (await btn.count() > 0 && await btn.isVisible()) {
+                    done = true;
+                    clearInterval(interval);
+                    resolve("onetrust");
+                    return;
+                  }
+                } catch {}
+              }
+            }, 500);
+            setTimeout(() => { clearInterval(interval); if (!done) reject(new Error("timeout")); }, 30000);
+          }),
+        ]);
+      } catch {
+        throw new Error("Timeout: page failed to load after retry");
+      }
     }
 
-    // Handle consent page if redirected there
-    if (page.url().includes("consent")) {
-      console.log(`[${account.email}] Handling consent page...`);
-      await page.waitForTimeout(3000);
+    if (found === "onetrust") {
+      console.log(`[${account.email}] Consent found, clicking accept...`);
+      // Click in whichever frame has it
       for (const frame of page.frames()) {
         try {
-          const agreeBtn = frame.locator('button:has-text("Agree and continue")');
-          if (await agreeBtn.count() > 0 && await agreeBtn.first().isVisible()) {
-            await agreeBtn.first().click();
+          const btn = frame.locator("#onetrust-accept-btn-handler");
+          if (await btn.count() > 0 && await btn.isVisible()) {
+            await btn.click();
             break;
           }
         } catch {}
       }
-      await page.waitForURL("**/www.gmx.com/", { timeout: 10000 }).catch(() => {});
-      await page.waitForTimeout(2000);
+      await page.locator("#login-button").waitFor({ state: "visible", timeout: 30000 });
     }
 
-    // Click the login button to open login layer
+    // Click login button to open login form
     console.log(`[${account.email}] Opening login form...`);
-    await page.locator(".button-login").first().click({ timeout: 10000 });
-
-    // Wait for login form inputs to become visible
-    await page.locator("#login-email").waitFor({ state: "visible", timeout: 5000 });
+    await page.locator("#login-button").click({ timeout: 10000 });
 
     // Fill credentials
+    await page.locator("#login-email").waitFor({ state: "visible", timeout: 5000 });
     console.log(`[${account.email}] Entering credentials...`);
     await page.locator("#login-email").fill(account.email);
     await page.locator("#login-password").fill(account.password);
 
-    // Submit the form
+    // Submit
     await page.locator("button.login-submit").click();
     console.log(`[${account.email}] Submitted login...`);
 
-    // Detect login outcome by watching for URL changes
+    // Detect outcome by page content (not URL)
     const result = await Promise.race([
-      // Success: redirected to mail dashboard
-      page
-        .waitForURL("**/navigator-bs.gmx.com/**", {
-          timeout: config.timeouts.loginResult,
-        })
+      // Account Active: mail dashboard nav appears
+      page.locator("#actions-menu-primary")
+        .waitFor({ state: "visible", timeout: 30000 })
         .then(() => "Account Active"),
 
-      // Failed login: redirected to /logout/ page with error
-      page
-        .waitForURL("**/logout/**", {
-          timeout: config.timeouts.loginResult,
-        })
-        .then(async () => {
-          const errorText = await page
-            .locator("div.error")
-            .first()
-            .textContent()
-            .catch(() => "");
-          const upper = (errorText || "").toUpperCase();
-          if (upper.includes("TRY AGAIN") || upper.includes("INVALID")) {
-            return "Wrong Password";
-          }
-          if (upper.includes("NOT FOUND") || upper.includes("DOES NOT EXIST")) {
-            return "Banned";
-          }
-          if (upper.includes("IRREGULARITY") || upper.includes("SUSPICIOUS") || upper.includes("SECURITY")) {
-            return "Irregularity";
-          }
-          return "Wrong Password";
-        }),
+      // Deleted: "invalid email address" text appears
+      page.getByText("invalid email address", { exact: false })
+        .waitFor({ state: "visible", timeout: 30000 })
+        .then(() => "Deleted"),
 
-      // CAPTCHA triggered
-      page
-        .locator(".captchafox, [class*='captcha' i]")
-        .first()
-        .waitFor({ state: "visible", timeout: config.timeouts.loginResult })
-        .then(() => "CAPTCHA Blocked"),
-
-      // Overall timeout
-      new Promise((resolve) =>
-        setTimeout(() => resolve("Error"), config.timeouts.loginResult + 2000)
-      ),
+      // Timeout: neither detected in 30s
+      new Promise((resolve) => setTimeout(() => resolve("Unknown"), 30000)),
     ]);
 
     account.status = result;
     console.log(`[${account.email}] => ${result}`);
+    // Brief delay before closing to let page settle
+    await page.waitForTimeout(3000);
     return result;
   } catch (error) {
     const msg = error.message || "";
     console.error(`[${account.email}] Error: ${msg}`);
-    // Retry on navigation/proxy timeouts (slow proxy rotation)
     if (msg.includes("net::ERR_") || msg.includes("Timeout") || msg.includes("ABORTED")) {
       return "Retry";
     }
@@ -197,6 +213,45 @@ async function attemptCheckAccount(browser, account, config) {
   } finally {
     await context.close();
   }
+}
+
+// --- Proxy Rotation ---
+
+async function rotateProxy(rotateUrl, browser, config) {
+  console.log("Rotating proxy IP...");
+  try {
+    const res = await fetch(rotateUrl);
+    const text = await res.text();
+    console.log(`Rotate response: ${text.trim()}`);
+  } catch (err) {
+    console.log(`Rotate request sent (${err.message})`);
+  }
+
+  // Wait for proxy to come back online — check IP through the proxy via browser
+  console.log("Waiting for proxy to come back online...");
+  await new Promise((r) => setTimeout(r, 5000)); // initial wait for rotation
+
+  for (let i = 0; i < 20; i++) {
+    const ctx = await browser.newContext({
+      proxy: config.proxy.server
+        ? { server: config.proxy.server, username: config.proxy.username, password: config.proxy.password }
+        : undefined,
+    });
+    try {
+      const pg = await ctx.newPage();
+      await pg.goto("https://httpbin.org/ip", { timeout: 10000 });
+      const body = await pg.locator("body").textContent();
+      const ip = JSON.parse(body).origin;
+      console.log(`Proxy online — IP: ${ip}`);
+      await fs.appendFile("IPs.txt", `${new Date().toISOString()} — ${ip}\n`);
+      await ctx.close();
+      return;
+    } catch {
+      await ctx.close();
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+  console.log("Warning: proxy may not be ready, continuing anyway...");
 }
 
 // --- Main ---
@@ -220,15 +275,16 @@ async function main(configPath = "config.json") {
   }
 
   // Filter to accounts that need checking (resumability)
-  const toCheck = accounts.filter((a) => a.status !== "Account Active");
+  const doneStatuses = ["Account Active", "Deleted"];
+  const toCheck = accounts.filter((a) => !doneStatuses.includes(a.status));
   const skipped = accounts.length - toCheck.length;
   if (skipped > 0) {
-    console.log(`Skipping ${skipped} accounts already marked as Active.`);
+    console.log(`Skipping ${skipped} accounts already marked as Active/Deleted.`);
   }
   console.log(`Checking ${toCheck.length} accounts...\n`);
 
   if (toCheck.length === 0) {
-    console.log("All accounts already active. Nothing to do.");
+    console.log("All accounts already processed. Nothing to do.");
     return;
   }
 
@@ -243,37 +299,37 @@ async function main(configPath = "config.json") {
 
   try {
     let processed = 0;
+    const batchSize = config.concurrency;
 
-    await runWithConcurrency(toCheck, config.concurrency, async (account) => {
-      await checkAccount(browser, account, config);
-      processed++;
-
-      // Write CSV after every account (for resumability)
-      await writeAccounts(config.accountsFile, accounts);
-
-      // Progress
-      console.log(`  Progress: ${processed}/${toCheck.length}\n`);
-
-      // Delay between accounts
-      if (config.timeouts.betweenAccounts > 0) {
-        await new Promise((r) => setTimeout(r, config.timeouts.betweenAccounts));
+    // Process in batches — rotate IP between each batch
+    for (let i = 0; i < toCheck.length; i += batchSize) {
+      // Rotate proxy before each batch (except the first)
+      if (i > 0 && config.rotateUrl) {
+        await rotateProxy(config.rotateUrl, browser, config);
       }
-    });
+
+      const batch = toCheck.slice(i, i + batchSize);
+      console.log(`\n--- Batch ${Math.floor(i / batchSize) + 1}: ${batch.map(a => a.email).join(", ")} ---`);
+
+      // Process batch concurrently
+      await Promise.all(batch.map(async (account) => {
+        await checkAccount(browser, account, config);
+        processed++;
+        await writeAccounts(config.accountsFile, accounts);
+        console.log(`  Progress: ${processed}/${toCheck.length}`);
+      }));
+    }
 
     // Final summary
     const active = accounts.filter((a) => a.status === "Account Active").length;
-    const banned = accounts.filter((a) => a.status === "Banned").length;
+    const deleted = accounts.filter((a) => a.status === "Deleted").length;
+    const unknown = accounts.filter((a) => a.status === "Unknown").length;
     const errors = accounts.filter((a) => a.status === "Error").length;
-    const captcha = accounts.filter((a) => a.status === "CAPTCHA Blocked").length;
-    const wrongPw = accounts.filter((a) => a.status === "Wrong Password").length;
-    const irregular = accounts.filter((a) => a.status === "Irregularity").length;
 
     console.log("\n=== DONE ===");
     console.log(`Active: ${active}`);
-    console.log(`Banned: ${banned}`);
-    console.log(`Wrong Password: ${wrongPw}`);
-    console.log(`CAPTCHA Blocked: ${captcha}`);
-    console.log(`Irregularity: ${irregular}`);
+    console.log(`Deleted: ${deleted}`);
+    console.log(`Unknown: ${unknown}`);
     console.log(`Errors: ${errors}`);
     console.log(`Total: ${accounts.length}`);
   } finally {
