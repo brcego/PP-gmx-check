@@ -58,6 +58,19 @@ export async function runWithConcurrency(items, maxConcurrent, fn) {
 // --- Browser Automation ---
 
 async function checkAccount(browser, account, config) {
+  const maxRetries = config.maxRetries || 2;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const result = await attemptCheckAccount(browser, account, config);
+    if (result !== "Retry") return;
+    console.log(`[${account.email}] Retrying (${attempt}/${maxRetries})...`);
+  }
+  // All retries exhausted
+  account.status = "Error";
+  console.log(`[${account.email}] => Error (max retries exhausted)`);
+}
+
+async function attemptCheckAccount(browser, account, config) {
   const context = await browser.newContext({
     proxy: config.proxy.server
       ? {
@@ -70,70 +83,60 @@ async function checkAccount(browser, account, config) {
 
   const page = await context.newPage();
 
-  try {
-    // Set consent bypass cookie to skip GDPR popup
-    await context.addCookies([
-      {
-        name: "euconsent-bypass",
-        value: "1",
-        domain: ".gmx.com",
-        path: "/",
-      },
-    ]);
+  // Block images to save proxy bandwidth
+  await page.route("**/*.{png,jpg,jpeg,gif,svg,webp,ico}", (route) =>
+    route.abort()
+  );
 
+  try {
     // Navigate to GMX
     console.log(`[${account.email}] Navigating to gmx.com...`);
-    await page.goto("https://www.gmx.com/", {
-      waitUntil: "domcontentloaded",
-      timeout: config.timeouts.navigation,
-    });
+    try {
+      await page.goto("https://www.gmx.com/", {
+        waitUntil: "load",
+        timeout: config.timeouts.navigation,
+      });
+    } catch {
+      await page.goto("https://www.gmx.com/", {
+        waitUntil: "domcontentloaded",
+        timeout: config.timeouts.navigation,
+      });
+    }
+
+    // Handle consent page if redirected there
+    if (page.url().includes("consent")) {
+      console.log(`[${account.email}] Handling consent page...`);
+      await page.waitForTimeout(3000);
+      for (const frame of page.frames()) {
+        try {
+          const agreeBtn = frame.locator('button:has-text("Agree and continue")');
+          if (await agreeBtn.count() > 0 && await agreeBtn.first().isVisible()) {
+            await agreeBtn.first().click();
+            break;
+          }
+        } catch {}
+      }
+      await page.waitForURL("**/www.gmx.com/", { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+    }
 
     // Click the login button to open login layer
     console.log(`[${account.email}] Opening login form...`);
-    const loginTrigger = page.locator(
-      'a.button-login, button.button-login, .nav-login, [data-target="login"]'
-    );
-    await loginTrigger.first().click({ timeout: 10000 });
+    await page.locator(".button-login").first().click({ timeout: 10000 });
 
-    // Wait for the login form to appear
-    // It may be in the main page or inside an iframe from auth.gmx.net
-    await page.waitForTimeout(1500);
-
-    // Try to find login fields — check iframes first, then main page
-    let loginFrame = page;
-    const frames = page.frames();
-    for (const frame of frames) {
-      const url = frame.url();
-      if (url.includes("auth.gmx") || url.includes("login")) {
-        const emailField = await frame.locator('input[type="email"], input[name="username"], input[placeholder*="mail" i]').count();
-        if (emailField > 0) {
-          loginFrame = frame;
-          console.log(`[${account.email}] Found login form in iframe: ${url}`);
-          break;
-        }
-      }
-    }
+    // Wait for login form inputs to become visible
+    await page.locator("#login-email").waitFor({ state: "visible", timeout: 5000 });
 
     // Fill credentials
     console.log(`[${account.email}] Entering credentials...`);
-    const emailInput = loginFrame.locator(
-      'input[type="email"], input[name="username"], input[placeholder*="mail" i], input[id*="email" i]'
-    );
-    const passwordInput = loginFrame.locator(
-      'input[type="password"], input[name="password"], input[placeholder*="assword" i]'
-    );
-
-    await emailInput.first().fill(account.email, { timeout: 5000 });
-    await passwordInput.first().fill(account.password, { timeout: 5000 });
+    await page.locator("#login-email").fill(account.email);
+    await page.locator("#login-password").fill(account.password);
 
     // Submit the form
-    const submitButton = loginFrame.locator(
-      'button[type="submit"], form button, .login-box button, button.btn-login'
-    );
-    await submitButton.first().click({ timeout: 5000 });
+    await page.locator("button.login-submit").click();
     console.log(`[${account.email}] Submitted login...`);
 
-    // Detect login outcome
+    // Detect login outcome by watching for URL changes
     const result = await Promise.race([
       // Success: redirected to mail dashboard
       page
@@ -142,36 +145,36 @@ async function checkAccount(browser, account, config) {
         })
         .then(() => "Account Active"),
 
+      // Failed login: redirected to /logout/ page with error
+      page
+        .waitForURL("**/logout/**", {
+          timeout: config.timeouts.loginResult,
+        })
+        .then(async () => {
+          const errorText = await page
+            .locator("div.error")
+            .first()
+            .textContent()
+            .catch(() => "");
+          const upper = (errorText || "").toUpperCase();
+          if (upper.includes("TRY AGAIN") || upper.includes("INVALID")) {
+            return "Wrong Password";
+          }
+          if (upper.includes("NOT FOUND") || upper.includes("DOES NOT EXIST")) {
+            return "Banned";
+          }
+          if (upper.includes("IRREGULARITY") || upper.includes("SUSPICIOUS") || upper.includes("SECURITY")) {
+            return "Irregularity";
+          }
+          return "Wrong Password";
+        }),
+
       // CAPTCHA triggered
       page
         .locator(".captchafox, [class*='captcha' i]")
         .first()
         .waitFor({ state: "visible", timeout: config.timeouts.loginResult })
         .then(() => "CAPTCHA Blocked"),
-
-      // Error banner (banned/deleted/wrong password)
-      page
-        .locator("div.error, .login-error, [class*='error' i]")
-        .first()
-        .waitFor({ state: "visible", timeout: config.timeouts.loginResult })
-        .then(async () => {
-          const errorText = await page
-            .locator("div.error, .login-error, [class*='error' i]")
-            .first()
-            .textContent()
-            .catch(() => "");
-          const upper = (errorText || "").toUpperCase();
-          if (upper.includes("TRY AGAIN") || upper.includes("NOT FOUND") || upper.includes("DOES NOT EXIST")) {
-            return "Banned";
-          }
-          if (upper.includes("PASSWORD") || upper.includes("CREDENTIAL") || upper.includes("INCORRECT")) {
-            return "Wrong Password";
-          }
-          if (upper.includes("IRREGULARITY") || upper.includes("SUSPICIOUS") || upper.includes("SECURITY")) {
-            return "Irregularity";
-          }
-          return "Banned";
-        }),
 
       // Overall timeout
       new Promise((resolve) =>
@@ -181,9 +184,16 @@ async function checkAccount(browser, account, config) {
 
     account.status = result;
     console.log(`[${account.email}] => ${result}`);
+    return result;
   } catch (error) {
-    console.error(`[${account.email}] Error: ${error.message}`);
+    const msg = error.message || "";
+    console.error(`[${account.email}] Error: ${msg}`);
+    // Retry on navigation/proxy timeouts (slow proxy rotation)
+    if (msg.includes("net::ERR_") || msg.includes("Timeout") || msg.includes("ABORTED")) {
+      return "Retry";
+    }
     account.status = "Error";
+    return "Error";
   } finally {
     await context.close();
   }
