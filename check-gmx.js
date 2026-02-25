@@ -31,3 +31,26 @@ export async function writeAccounts(filePath, accounts) {
   const lines = accounts.map((a) => `${a.email},${a.password},${a.status}`);
   await fs.writeFile(filePath, [header, ...lines].join("\n"), "utf-8");
 }
+
+// --- Worker Pool ---
+
+export async function runWithConcurrency(items, maxConcurrent, fn) {
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const currentIndex = index++;
+      try {
+        await fn(items[currentIndex]);
+      } catch (error) {
+        console.error(`Error processing item ${currentIndex}:`, error.message);
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(maxConcurrent, items.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+}
