@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+accounts.csv
+accounts 2.csv
+proxy.csv
+config.json
+config.test.json
+test-accounts*.csv
+debug.png
